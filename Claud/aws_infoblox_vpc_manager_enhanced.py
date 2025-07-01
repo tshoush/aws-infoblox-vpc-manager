@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""
+AWS to InfoBlox VPC Management Tool - Enhanced Version with Interactive Selection
+
+All features implemented:
+1. Interactive configuration display & editing
+2. Priority-based network creation (larger networks first)
+3. Configurable container detection
+4. Categorized rejected networks CSV generation
+5. Enhanced Extended Attributes reporting
+6. CSV file environment configuration
+7. Interactive network view selection to avoid case sensitivity issues
+8. Interactive CSV file selection
+
+Author: Generated for AWS-InfoBlox Integration
+Date: June 4, 2025
+"""
+
+import pandas as pd
+import requests
+import json
+import urllib3
+import ast
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+import argparse
+import os
+from dotenv import load_dotenv
+import getpass
+import sys
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- BEGIN LOG FILE TEST ---
+# Using an absolute path for the log file
+ABS_LOG_FILE_PATH = os.path.abspath('aws_infoblox_vpc_manager.log')
+try:
+    with open(ABS_LOG_FILE_PATH, 'a') as f:
+        f.write(f"--- Log file test write at {datetime.now()} to ABSOLUTE PATH: {ABS_LOG_FILE_PATH} ---\n")
+    print(f"INFO: Successfully wrote a test line to ABSOLUTE PATH: '{ABS_LOG_FILE_PATH}'.")
+except Exception as e:
+    print(f"ERROR: Could not write to ABSOLUTE log file path '{ABS_LOG_FILE_PATH}'. Error: {e}")
+# --- END LOG FILE TEST ---
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(ABS_LOG_FILE_PATH),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def select_from_list(items: List[str], prompt: str, allow_custom: bool = False) -> str:
+    """Present a numbered list and let user select by number"""
+    if not items:
+        if allow_custom:
+            return input(f"{prompt} (no options available, enter manually): ").strip()
+        else:
+            raise ValueError("No items available to select from")
+    
+    print(f"\n{prompt}")
+    for i, item in enumerate(items, 1):
+        print(f"  {i}. {item}")
+    
+    if allow_custom:
+        print(f"  {len(items) + 1}. Enter custom value")
+    
+    while True:
+        try:
+            choice = input(f"\nSelect option (1-{len(items) + (1 if allow_custom else 0)}): ").strip()
+            choice_num = int(choice)
+            
+            if 1 <= choice_num <= len(items):
+                return items[choice_num - 1]
+            elif allow_custom and choice_num == len(items) + 1:
+                return input("Enter custom value: ").strip()
+            else:
+                print(f"Invalid choice. Please select 1-{len(items) + (1 if allow_custom else 0)}")
+        except ValueError:
+            print("Please enter a number")
+
+
+def main():
+    """Main function with all enhanced features"""
+    args = parse_arguments()
+    
+    try:
+        # Show and optionally edit configuration
+        config_override = show_and_edit_config()
+        
+        # Get configuration
+        skip_prompt = args.network_view is not None
+        grid_master, network_view, username, password, csv_file_from_env, container_prefixes, container_mode = get_config(
+            skip_network_view_prompt=skip_prompt, 
+            config_override=config_override
+        )
+        
+        # Override network view if specified
+        if args.network_view:
+            network_view = args.network_view
+            print(f"Using network view from command line: {network_view}")
+        
+        # Show container configuration
+        if container_prefixes:
+            print(f"📦 Container prefixes configured: /{', /'.join(map(str, container_prefixes))}")
+            print(f"🔧 Container mode: {container_mode}")
+        else:
+            print("📦 Container detection: Auto-detect from InfoBlox")
+        
+        # Use command line argument if provided, otherwise use environment variable
+        csv_file = args.csv_file if args.csv_file != 'vpc_data.csv' else csv_file_from_env
+        
+        logger.info(f"Loading VPC data from {csv_file}...")
+        
+        # Initialize InfoBlox client
+        print(f"\n🔗 Connecting to InfoBlox Grid Master: {grid_master}")
+        ib_client = InfoBloxClient(grid_master, username, password)
+        
+        # Initialize VPC Manager
+        vpc_manager = VPCManager(ib_client)
+        
+        # Load and parse VPC data
+        try:
+            vpc_df = vpc_manager.load_vpc_data(csv_file)
+            vpc_df = vpc_manager.parse_vpc_tags(vpc_df)
+        except Exception as e:
+            logger.error(f"Failed to load VPC data: {e}")
+            return 1
+        
+        print(f"\n📊 ANALYSIS SUMMARY:")
+        print(f"   📁 CSV file: {csv_file}")
+        print(f"   🔢 Total VPCs loaded: {len(vpc_df)}")
+        print(f"   🌐 Network view: {network_view}")
+        
+        # Compare with InfoBlox
+        logger.info("Comparing AWS VPCs with InfoBlox networks...")
+        comparison_results = vpc_manager.compare_vpc_with_infoblox(vpc_df, network_view)
+        
+        # Display results
+        print(f"\n🔍 COMPARISON RESULTS:")
+        print(f"   ✅ Matching networks: {len(comparison_results['matches'])}")
+        print(f"   🔴 Missing networks: {len(comparison_results['missing'])}")
+        print(f"   🟡 Tag discrepancies: {len(comparison_results['discrepancies'])}")
+        print(f"   📦 Network containers: {len(comparison_results['containers'])}")
+        print(f"   ❌ Processing errors: {len(comparison_results['errors'])}")
+        
+        # Show update requirements summary
+        if comparison_results['discrepancies']:
+            print(f"\n🔧 UPDATE REQUIREMENTS:")
+            print(f"   🏷️ Networks requiring EA updates: {len(comparison_results['discrepancies'])}")
+            
+            # Show sample of networks that need updates
+            sample_discrepancies = comparison_results['discrepancies'][:3]
+            for item in sample_discrepancies:
+                vpc_name = item['vpc'].get('Name', 'Unnamed')
+                cidr = item['cidr']
+                print(f"   📄 {cidr} ({vpc_name}) - EAs need updating")
+            
+            if len(comparison_results['discrepancies']) > 3:
+                print(f"   ... and {len(comparison_results['discrepancies']) - 3} more networks")
+        
+        # Show network containers summary
+        if comparison_results.get('containers'):
+            print(f"\n📦 NETWORK CONTAINERS FOUND:")
+            print(f"   🔢 VPCs existing as containers: {len(comparison_results['containers'])}")
+            print(f"   ℹ️ These exist as network containers (parent networks) in InfoBlox")
+            print(f"   💡 Container networks typically contain smaller subnet networks")
+            for container in comparison_results['containers'][:3]:
+                print(f"   📦 {container['cidr']} - {container['vpc']['Name']}")
+            if len(comparison_results['containers']) > 3:
+                print(f"   ... and {len(comparison_results['containers']) - 3} more")
+        
+        # Analyze Extended Attributes (regardless of missing networks)
+        if args.create_missing:
+            print(f"\n🔍 EXTENDED ATTRIBUTES ANALYSIS:")
+            ea_analysis = vpc_manager.ensure_required_eas(vpc_df, dry_run=args.dry_run)
+            
+            # Generate EA summary report
+            reports_dir = "reports"
+            os.makedirs(reports_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ea_report_filename = os.path.join(reports_dir, f"extended_attributes_summary_{timestamp}.txt")
+            
+            eas_to_report = []
+            report_ea_title = ""
+
+            if args.dry_run:
+                print(f"   🏷️ Extended Attributes analysis: {len(ea_analysis['missing_eas'])} missing")
+                eas_to_report = ea_analysis.get('missing_eas', [])
+                report_ea_title = "Missing Extended Attributes (would be created):"
+            else:
+                print(f"   🏷️ Extended Attributes: {ea_analysis['created_count']} created, {ea_analysis['existing_count']} existed")
+                created_eas = [name for name, status in ea_analysis.get('ea_results', {}).items() if status == 'created']
+                eas_to_report = created_eas
+                report_ea_title = "Extended Attributes Created:"
+
+            if eas_to_report:
+                with open(ea_report_filename, 'w') as f:
+                    f.write(f"{report_ea_title}\n")
+                    f.write("=" * len(report_ea_title) + "\n")
+                    for ea_name in eas_to_report:
+                        f.write(f"{ea_name}\n")
+                logger.info(f"Generated Extended Attributes summary: {ea_report_filename}")
+                print(f"   📄 Extended Attributes summary file: {ea_report_filename}")
+            else:
+                logger.info("No new or missing Extended Attributes to report.")
+
+        # Handle create-missing flag for networks
+        if args.create_missing and comparison_results['missing']:
+            print(f"\n🚀 CREATING MISSING NETWORKS:")
+            
+            # Sort missing networks by priority (larger networks first)
+            missing_with_priority = []
+            for item in comparison_results['missing']:
+                vpc = item['vpc']
+                aws_tags = item['aws_tags']
+                priority = vpc_manager._calculate_network_priority(vpc, aws_tags)
+                missing_with_priority.append((priority, item))
+            
+            # Sort by priority
+            missing_with_priority.sort(key=lambda x: x[0])
+            sorted_missing = [item for priority, item in missing_with_priority]
+            
+            print(f"   📋 Creating {len(sorted_missing)} networks in priority order...")
+            print(f"   🔢 Priority order: larger networks (/16, /17) before smaller (/24, /25)")
+            
+            # Create networks
+            operation_results = vpc_manager.create_missing_networks(
+                sorted_missing, 
+                network_view=network_view, 
+                dry_run=args.dry_run
+            )
+            
+            # Show results
+            created_count = sum(1 for r in operation_results if r.get('action') == 'created')
+            would_create_count = sum(1 for r in operation_results if r.get('action') == 'would_create')
+            error_count = sum(1 for r in operation_results if r.get('action') == 'error')
+            rejected_count = sum(1 for r in operation_results if r.get('action') == 'would_reject')
+            
+            if args.dry_run:
+                print(f"   ✅ Would create: {would_create_count}")
+                print(f"   ⚠️ Would reject: {rejected_count}")
+                print(f"   ❌ Would fail: {error_count}")
+            else:
+                print(f"   ✅ Successfully created: {created_count}")
+                print(f"   ❌ Failed to create: {error_count}")
+                if error_count > 0:
+                    print(f"   📄 Check rejected networks CSV for failed creations")
+        
+        # Handle EA Discrepancies
+        if args.create_missing and comparison_results['discrepancies']:
+            print(f"\n🔧 FIXING EA DISCREPANCIES:")
+            discrepancy_results = vpc_manager.fix_ea_discrepancies(
+                comparison_results['discrepancies'], 
+                dry_run=args.dry_run
+            )
+            
+            if args.dry_run:
+                print(f"   🔧 Would update {discrepancy_results['would_update_count']} networks with correct EAs")
+            else:
+                print(f"   ✅ Updated {discrepancy_results['updated_count']} networks")
+                print(f"   ❌ Failed to update {discrepancy_results['failed_count']} networks")
+
+        # Generate EA Discrepancies Report
+        if comparison_results['discrepancies']:
+            generate_ea_discrepancies_report(comparison_results['discrepancies'])
+        
+        # Generate Comprehensive Network Status Report
+        generate_network_status_report(comparison_results, args.dry_run)
+
+        print(f"\n✅ OPERATION COMPLETED")
+        print(f"   📝 Check logs: aws_infoblox_vpc_manager.log (or its absolute path)")
+        print(f"   📊 For detailed reports, check the reports/ directory")
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Operation cancelled by user")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        print(f"\n❌ Error: {e}")
+        return 1
+
+
+class InfoBloxClient:
+    """InfoBlox WAPI client for network management"""
+    
+    def __init__(self, grid_master: str, username: str, password: str, api_version: str = "v2.13.1"):
+        self.grid_master = grid_master
+        self.username = username
+        self.password = password
+        self.api_version = api_version
+        self.base_url = f"https://{grid_master}/wapi/{api_version}"
+        self.session = requests.Session()
+        self.session.auth = (username, password)
+        self.session.verify = False
+        self._ea_cache = {}
+        
+    def _make_request(self, method: str, endpoint: str, params: Optional[Dict] = None, data: Optional[Dict] = None) -> requests.Response:
+        """Make HTTP request to InfoBlox WAPI"""
+        url = f"{self.base_url}/{endpoint}"
+        
+        try:
+            if method.upper() == 'GET':
+                response = self.session.get(url, params=params)
+            elif method.upper() == 'POST':
+                response = self.session.post(url, json=data, params=params)
+            elif method.upper() == 'PUT':
+                response = self.session.put(url, json=data, params=params)
+            elif method.upper() == 'DELETE':
+                response = self.session.delete(url, params=params)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+                
+            response.raise_for_status()
+            return response
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"InfoBlox API request failed: {e}"
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    if 'text' in error_details:
+                        error_msg += f" - Details: {error_details['text']}"
+                    elif 'Error' in error_details:
+                        error_msg += f" - Details: {error_details['Error']}"
+                except:
+                    error_msg += f" - Response: {e.response.text}"
+            logger.error(error_msg)
+            raise
+    
+    def get_network_views(self) -> List[Dict]:
+        """Get all network views from InfoBlox"""
+        try:
+            response = self._make_request('GET', 'networkview')
+            views = response.json()
+            return views
+        except Exception as e:
+            logger.error(f"Error fetching network views: {e}")
+            return []
+    
+    def get_csv_files(self) -> List[str]:
+        """Get list of CSV files in current directory"""
+        try:
+            csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
+            return sorted(csv_files)
+        except Exception as e:
+            logger.error(f"Error listing CSV files: {e}")
+            return []
+    
+    def get_network_by_cidr(self, cidr: str, network_view: str = "default") -> Optional[Dict]:
+        """Get specific network by CIDR block"""
+        params = {
+            'network': cidr,
+            'network_view': network_view,
+            '_return_fields': 'network,comment,extattrs,_ref'
+        }
+        
+        try:
+            response = self._make_request('GET', 'network', params=params)
+            networks = response.json()
+            if networks:
+                logger.debug(f"Found network {cidr} in view {network_view}")
+                return networks[0]
+            else:
+                logger.debug(f"Network {cidr} not found in view {network_view}")
+                return None
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 400 or e.response.status_code == 404:
+                logger.debug(f"Network {cidr} not found in view {network_view} (HTTP {e.response.status_code})")
+                return None
+            else:
+                logger.error(f"Error checking network {cidr}: HTTP {e.response.status_code}")
+                raise
+    
+    def get_network_container_by_cidr(self, cidr: str, network_view: str = "default") -> Optional[Dict]:
+        """Get specific network container by CIDR block"""
+        params = {
+            'network': cidr,
+            'network_view': network_view,
+            '_return_fields': 'network,comment,extattrs,_ref'
+        }
+        
+        try:
+            response = self._make_request('GET', 'networkcontainer', params=params)
+            containers = response.json()
+            if containers:
+                logger.debug(f"Found network container {cidr} in view {network_view}")
+                return containers[0]
+            else:
+                logger.debug(f"Network container {cidr} not found in view {network_view}")
+                return None
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 400 or e.response.status_code == 404:
+                logger.debug(f"Network container {cidr} not found in view {network_view} (HTTP {e.response.status_code})")
+                return None
+            else:
+                logger.error(f"Error checking network container {cidr}: HTTP {e.response.status_code}")
+                raise
+    
+    def check_network_or_container_exists(self, cidr: str, network_view: str = "default") -> Dict:
+        """Check if CIDR exists as either a network or network container"""
+        # First check if it exists as a regular network
+        network = self.get_network_by_cidr(cidr, network_view)
+        if network:
+            return {
+                'exists': True,
+                'type': 'network',
+                'object': network
+            }
+        
+        # Then check if it exists as a network container
+        container = self.get_network_container_by_cidr(cidr, network_view)
+        if container:
+            return {
+                'exists': True,
+                'type': 'container',
+                'object': container
+            }
+        
+        return {
+            'exists': False,
+            'type': None,
+            'object': None
+        }
+    
+    def create_network(self, cidr: str, network_view: str = "default", 
+                      comment: str = "", extattrs: Optional[Dict[str, str]] = None) -> Dict:
+        """Create a new network in InfoBlox"""
+        data = {
+            'network': cidr,
+            'network_view': network_view
+        }
+        
+        if comment:
+            data['comment'] = comment
+            
+        if extattrs:
+            data['extattrs'] = {k: {'value': v} for k, v in extattrs.items()}
+        
+        response = self._make_request('POST', 'network', data=data)
+        logger.info(f"Created network {cidr} in view {network_view}")
+        return response.json()
+    
+    def get_extensible_attributes(self) -> List[Dict]:
+        """Get all Extended Attribute definitions from InfoBlox"""
+        if 'definitions' not in self._ea_cache:
+            response = self._make_request('GET', 'extensibleattributedef')
+            self._ea_cache['definitions'] = response.json()
+        return self._ea_cache['definitions']
+    
+    def create_extensible_attribute(self, name: str, data_type: str = "STRING", 
+                                  comment: str = "", default_value: str = "") -> Dict:
+        """Create a new Extended Attribute definition in InfoBlox"""
+        data = {
+            'name': name,
+            'type': data_type,
+            'comment': comment
+        }
+        
+        if default_value:
+            data['default_value'] = default_value
+        
+        try:
+            response = self._make_request('POST', 'extensibleattributedef', data=data)
+            logger.info(f"Created Extended Attribute definition: {name}")
+            if 'definitions' in self._ea_cache:
+                del self._ea_cache['definitions']
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 400:
+                error_details = e.response.text
+                if "already exists" in error_details.lower():
+                    logger.info(f"Extended Attribute {name} already exists")
+                    return {'status': 'exists', 'name': name}
+            raise
+    
+    def ensure_required_eas_exist(self, required_eas: List[str]) -> Dict[str, str]:
+        """Ensure required Extended Attributes exist in InfoBlox, create if missing"""
+        existing_eas = self.get_extensible_attributes()
+        existing_names = {ea['name'] for ea in existing_eas}
+        
+        results = {}
+        
+        for ea_name in required_eas:
+            if ea_name not in existing_names:
+                logger.info(f"Creating missing Extended Attribute: {ea_name}")
+                result = self.create_extensible_attribute(
+                    name=ea_name,
+                    data_type="STRING",
+                    comment=f"AWS tag mapping for {ea_name}",
+                    default_value=""
+                )
+                results[ea_name] = 'created'
+            else:
+                results[ea_name] = 'exists'
+        
+        return results
+    
+    def update_network_extattrs(self, network_ref: str, extattrs: Dict[str, str]) -> Dict:
+        """Update Extended Attributes for an existing network"""
+        # Format extattrs for InfoBlox API
+        formatted_extattrs = {k: {'value': v} for k, v in extattrs.items()}
+        
+        data = {
+            'extattrs': formatted_extattrs
+        }
+        
+        # Use the network reference to update
+        response = self._make_request('PUT', network_ref, data=data)
+        logger.info(f"Updated Extended Attributes for network {network_ref}")
+        return response.json()
+
+
+class AWSTagParser:
+    """Handles parsing of AWS tags from various formats"""
+    
+    @staticmethod
+    def parse_tags_from_string(tags_str: str) -> Dict[str, str]:
+        """Parse AWS tags from string representation"""
+        if not tags_str or pd.isna(tags_str) or tags_str == '[]':
+            return {}
+        
+        try:
+            if isinstance(tags_str, str):
+                tags_str = tags_str.strip()
+                if tags_str.startswith('[') and tags_str.endswith(']'):
+                    tag_list = ast.literal_eval(tags_str)
+                    if isinstance(tag_list, list):
+                        return {tag['Key']: tag['Value'] for tag in tag_list if 'Key' in tag and 'Value' in tag}
+            elif isinstance(tags_str, list):
+                return {tag['Key']: tag['Value'] for tag in tags_str if 'Key' in tag and 'Value' in tag}
+            
+            return {}
+            
+        except (ValueError, SyntaxError, KeyError) as e:
+            logger.warning(f"Error parsing tags: {tags_str[:100]}... Error: {e}")
+            return {}
+
+
+class VPCManager:
+    """Main class for managing AWS VPC to InfoBlox synchronization"""
+    
+    def __init__(self, infoblox_client: InfoBloxClient):
+        self.ib_client = infoblox_client
+        self.tag_parser = AWSTagParser()
+        
+    def load_vpc_data(self, csv_file_path: str) -> pd.DataFrame:
+        """Load VPC data from CSV file"""
+        try:
+            df = pd.read_csv(csv_file_path)
+            logger.info(f"Loaded {len(df)} VPC records from {csv_file_path}")
+            return df
+        except Exception as e:
+            logger.error(f"Error loading VPC data: {e}")
+            raise
+    
+    def parse_vpc_tags(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Parse tags column and add parsed tags as new column"""
+        df = df.copy()
+        df['ParsedTags'] = df['Tags'].apply(self.tag_parser.parse_tags_from_string)
+        return df
+    
+    def map_aws_tags_to_infoblox_eas(self, aws_tags: Dict[str, str]) -> Dict[str, str]:
+        """Map AWS tags to InfoBlox Extended Attributes"""
+        tag_mapping = {
+            'Name': 'aws_name',
+            'environment': 'environment', 
+            'Environment': 'environment',
+            'owner': 'owner',
+            'Owner': 'owner', 
+            'project': 'project',
+            'Project': 'project',
+            'location': 'aws_location',
+            'Location': 'aws_location',
+            'cloudservice': 'aws_cloudservice',
+            'createdby': 'aws_created_by',
+            'RequestedBy': 'aws_requested_by',
+            'Requested_By': 'aws_requested_by',
+            'dud': 'aws_dud',
+            'AccountId': 'aws_account_id',
+            'Region': 'aws_region',
+            'VpcId': 'aws_vpc_id',
+            'Description': 'description'
+        }
+        
+        mapped_eas = {}
+        for aws_key, aws_value in aws_tags.items():
+            ea_key = tag_mapping.get(aws_key, f"aws_{aws_key.lower()}")
+            ea_key = ea_key.replace('-', '_').replace(' ', '_').lower()
+            ea_value = str(aws_value)[:255] if len(str(aws_value)) > 255 else str(aws_value)
+            mapped_eas[ea_key] = ea_value
+        
+        return mapped_eas
+    
+    def compare_vpc_with_infoblox(self, vpc_df: pd.DataFrame, network_view: str = "default") -> Dict:
+        """Compare AWS VPC data with InfoBlox networks and network containers"""
+        results = {
+            'matches': [],
+            'missing': [], 
+            'discrepancies': [],
+            'containers': [],
+            'errors': []
+        }
+        
+        for _, vpc in vpc_df.iterrows():
+            cidr = vpc['CidrBlock']
+            vpc_id = vpc.get('VpcId', 'unknown')
+            
+            try:
+                aws_tags = vpc.get('ParsedTags', {})
+                mapped_eas = self.map_aws_tags_to_infoblox_eas(aws_tags)
+                
+                # Check if network exists
+                existence_check = self.ib_client.check_network_or_container_exists(cidr, network_view)
+                
+                if not existence_check['exists']:
+                    logger.debug(f"Network {cidr} ({vpc_id}) not found in InfoBlox")
+                    results['missing'].append({
+                        'vpc': vpc.to_dict(),
+                        'cidr': cidr,
+                        'aws_tags': aws_tags,
+                        'mapped_eas': mapped_eas
+                    })
+                elif existence_check['type'] == 'container':
+                    logger.info(f"CIDR {cidr} ({vpc_id}) exists as network container in InfoBlox")
+                    ib_container = existence_check['object']
+                    ib_eas = {k: v.get('value', '') for k, v in ib_container.get('extattrs', {}).items()}
+                    
+                    results['containers'].append({
+                        'vpc': vpc.to_dict(),
+                        'cidr': cidr,
+                        'ib_container': ib_container,
+                        'aws_tags': aws_tags,
+                        'ib_eas': ib_eas,
+                        'mapped_eas': mapped_eas,
+                        'note': 'Exists as network container - contains subnets'
+                    })
+                else:
+                    # Network exists as regular network
+                    logger.debug(f"Network {cidr} ({vpc_id}) found in InfoBlox")
+                    ib_network = existence_check['object']
+                    ib_eas = {k: v.get('value', '') for k, v in ib_network.get('extattrs', {}).items()}
+                    
+                    # Compare EAs
+                    ea_match = self._compare_eas(mapped_eas, ib_eas)
+                    
+                    if ea_match:
+                        logger.debug(f"Network {cidr} ({vpc_id}) has matching EAs")
+                        results['matches'].append({
+                            'vpc': vpc.to_dict(),
+                            'cidr': cidr,
+                            'ib_network': ib_network,
+                            'aws_tags': aws_tags,
+                            'ib_eas': ib_eas,
+                            'mapped_eas': mapped_eas
+                        })
+                    else:
+                        logger.info(f"Network {cidr} ({vpc_id}) has EA discrepancies")
+                        results['discrepancies'].append({
+                            'vpc': vpc.to_dict(),
+                            'cidr': cidr,
+                            'ib_network': ib_network,
+                            'aws_tags': aws_tags,
+                            'ib_eas': ib_eas,
+                            'mapped_eas': mapped_eas
+                        })
+                        
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error processing VPC {vpc_id} ({cidr}): {error_msg}")
+                
+                # Try to provide more context about the error
+                if "not found" in error_msg.lower() or "404" in error_msg:
+                    logger.info(f"Network {cidr} ({vpc_id}) appears to not exist in InfoBlox")
+                    results['missing'].append({
+                        'vpc': vpc.to_dict(),
+                        'cidr': cidr,
+                        'aws_tags': aws_tags,
+                        'mappe

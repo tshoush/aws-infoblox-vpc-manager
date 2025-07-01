@@ -1,0 +1,47 @@
+[run]
+source = .
+omit = 
+    */tests/*
+    */venv/*
+    */test_*
+    */__pycache__/*
+    */site-packages/*
+    setup.py
+    conftest.py
+    */migrations/*
+    */web_app/static/*
+
+[report]
+precision = 2
+show_missing = True
+skip_covered = False
+skip_empty = True
+
+exclude_lines =
+    # Standard pragma
+    pragma: no cover
+    
+    # Don't complain about missing debug-only code
+    def __repr__
+    if self\.debug
+    
+    # Don't complain if tests don't hit defensive assertion code
+    raise AssertionError
+    raise NotImplementedError
+    
+    # Don't complain if non-runnable code isn't run
+    if 0:
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    
+    # Don't complain about abstract methods
+    @(abc\.)?abstractmethod
+    
+    # Ignore pass statements
+    pass
+
+[html]
+directory = htmlcov
+
+[xml]
+output = coverage.xml

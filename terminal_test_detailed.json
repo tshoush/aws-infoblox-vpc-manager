@@ -1,0 +1,29 @@
+{
+  "test_time": "2025-06-07 19:58:37.317264",
+  "tests": {
+    "system_info": {
+      "python_version": "3.13.0 (tags/v3.13.0:60403a5, Oct  7 2024, 09:38:07) [MSC v.1941 64 bit (AMD64)]",
+      "working_directory": "C:\\Users\\tmsho448\\Marriot",
+      "platform": "win32",
+      "executable": "C:\\Users\\tmsho448\\Marriot\\venv\\Scripts\\python.exe"
+    },
+    "directory_listing": {
+      "success": true,
+      "files_count": 71
+    },
+    "packages": {
+      "pandas": "2.2.3",
+      "requests": "2.32.3"
+    },
+    "file_operations": {
+      "write": "success",
+      "file_exists": true
+    },
+    "environment_variables": {
+      "PATH": "Set",
+      "PYTHONPATH": "Not Set",
+      "GRID_MASTER": "Not Set",
+      "INFOBLOX_USERNAME": "Not Set"
+    }
+  }
+}
